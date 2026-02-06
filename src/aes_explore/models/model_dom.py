@@ -6,6 +6,7 @@ Features:
 - Byte-serial datapath (16 bytes processed sequentially through S-box)
 - Canright-style S-box with configurable pipeline (5 or 8 stages)
 - Precise cycle and randomness tracking
+- Key masking: initial key is split into d+1 shares (randomness accounted)
 
 Cycle costs (configurable):
 - SubBytes: 16 + (pipeline_depth - 1) cycles (byte-serial with pipeline latency)
@@ -18,15 +19,17 @@ import random
 
 from ..aes_core import (
     key_expansion,
+    add_round_key,
     apply_shift_rows_to_shares,
     apply_mix_columns_to_shares,
     apply_add_round_key_to_shares,
 )
 from ..counters import CycleCounter, RandomnessCounter
-from ..trace import TraceRecorder
+from ..trace import TraceRecorder, VerboseTracer
 from ..utils import (
     bytes_to_state,
     state_to_bytes,
+    bytes_to_hex,
     copy_state,
 )
 from ..dom.sbox_canright_dom import DomCanrightSBoxPipeline, share_value, recombine_shares
@@ -54,15 +57,6 @@ class DomModel:
         seed: int | None = None,
         tracer: TraceRecorder | None = None,
     ):
-        """
-        Initialize the DOM model.
-
-        Args:
-            d: Protection order (1 or 2)
-            sbox_variant: S-box pipeline variant (5 or 8)
-            seed: RNG seed (random if None)
-            tracer: Optional trace recorder
-        """
         if d not in (1, 2):
             raise ValueError(f"Protection order d must be 1 or 2, got {d}")
         if sbox_variant not in (5, 8):
@@ -77,9 +71,10 @@ class DomModel:
         self.seed = seed if seed is not None else random.randint(0, 2**32 - 1)
         self.rng = random.Random(self.seed)
 
-        # Counters
+        # Counters — enable draw-level log when verbose tracing is active
+        track = tracer is not None and tracer.verbose
         self.cycle_counter = CycleCounter()
-        self.randomness_counter = RandomnessCounter()
+        self.randomness_counter = RandomnessCounter(track_draws=track)
 
         # State shares: list of d+1 4x4 states
         self._state_shares: list[list[list[int]]] = []
@@ -89,6 +84,9 @@ class DomModel:
 
         # S-box pipeline
         self._sbox: DomCanrightSBoxPipeline | None = None
+
+        # Verbose tracer (set up in encrypt() if active)
+        self._vt: VerboseTracer | None = None
 
     def _create_sbox(self) -> DomCanrightSBoxPipeline:
         """Create a fresh S-box pipeline instance."""
@@ -101,12 +99,13 @@ class DomModel:
             tracer=self.tracer,
         )
 
-    def _share_state(self, state: list[list[int]]) -> list[list[list[int]]]:
+    def _share_grid(self, state: list[list[int]], purpose: str) -> list[list[list[int]]]:
         """
-        Create d+1 shares of a state.
+        Create d+1 shares of a 4x4 state and account for randomness.
 
         Args:
             state: 4x4 state to share
+            purpose: RNG purpose tag (e.g. "key_mask", "state_mask_init")
 
         Returns:
             List of d+1 4x4 state shares
@@ -118,11 +117,10 @@ class DomModel:
                 byte_val = state[row][col]
                 byte_shares = share_value(byte_val, self.num_shares, 0xFF, self.rng)
 
-                # Count randomness for initial sharing
                 self.randomness_counter.add(
                     self.d * 8,
                     width=8,
-                    operation="state_sharing"
+                    operation=purpose,
                 )
 
                 for share_idx in range(self.num_shares):
@@ -131,15 +129,7 @@ class DomModel:
         return shares
 
     def _recombine_state(self, shares: list[list[list[int]]]) -> list[list[int]]:
-        """
-        Recombine state shares by XORing.
-
-        Args:
-            shares: List of d+1 4x4 state shares
-
-        Returns:
-            4x4 recombined state
-        """
+        """Recombine state shares by XORing."""
         result = [[0 for _ in range(4)] for _ in range(4)]
         for row in range(4):
             for col in range(4):
@@ -149,17 +139,12 @@ class DomModel:
                 result[row][col] = val
         return result
 
+    # ------------------------------------------------------------------
+    # Encryption entry point
+    # ------------------------------------------------------------------
+
     def encrypt(self, key: bytes, plaintext: bytes) -> bytes:
-        """
-        Encrypt a single 16-byte block with DOM protection.
-
-        Args:
-            key: 16-byte AES key
-            plaintext: 16-byte plaintext
-
-        Returns:
-            16-byte ciphertext
-        """
+        """Encrypt a single 16-byte block with DOM protection."""
         if len(key) != 16:
             raise ValueError(f"Key must be 16 bytes, got {len(key)}")
         if len(plaintext) != 16:
@@ -169,14 +154,37 @@ class DomModel:
         self.cycle_counter.reset()
         self.randomness_counter.reset()
 
+        # Set up verbose tracer
+        vt = None
+        if self.tracer and self.tracer.verbose:
+            vt = VerboseTracer(self.randomness_counter)
+            self.tracer.vtracer = vt
+        self._vt = vt
+
+        # Print header
+        if vt:
+            vt.header(self.d, self.seed, self.sbox_variant,
+                      bytes_to_hex(plaintext), bytes_to_hex(key))
+
         # Pre-compute round keys (unmasked)
         self._round_keys = key_expansion(key)
 
-        # Initialize state and create shares
-        initial_state = bytes_to_state(plaintext)
-        self._state_shares = self._share_state(initial_state)
+        # ----- INIT: key masking -----
+        self.randomness_counter.snapshot()
+        initial_key_state = bytes_to_state(key)
+        key_shares = self._share_grid(initial_key_state, "key_mask")
+        if vt:
+            vt.init_event("key_mask", key_shares, initial_key_state)
 
-        # Trace initial state
+        # ----- INIT: state masking -----
+        self.randomness_counter.snapshot()
+        initial_state = bytes_to_state(plaintext)
+        self._state_shares = self._share_grid(initial_state, "state_mask_init")
+        if vt:
+            vt.init_event("state_mask_init", self._state_shares,
+                          initial_state)
+
+        # Trace initial state (JSON)
         if self.tracer:
             self.tracer.record(
                 cycle=0,
@@ -186,10 +194,10 @@ class DomModel:
                 recombined=self._recombine_state(self._state_shares),
             )
 
-        # Initial AddRoundKey (round 0)
-        self._add_round_key(0)
+        # ----- Initial AddRoundKey (round 0) using key shares -----
+        self._add_round_key_init(key_shares, 0)
 
-        # Rounds 1-9: full rounds
+        # Rounds 1-9: full rounds (unmasked round keys)
         for rnd in range(1, 10):
             self._full_round(rnd)
 
@@ -200,37 +208,64 @@ class DomModel:
         final_state = self._recombine_state(self._state_shares)
         return state_to_bytes(final_state)
 
-    def _add_round_key(self, round_num: int) -> None:
-        """
-        Apply AddRoundKey to state shares.
+    # ------------------------------------------------------------------
+    # Round operations
+    # ------------------------------------------------------------------
 
-        The round key is XORed only to the first share (share 0).
-        """
+    def _add_round_key_init(self, key_shares: list[list[list[int]]], round_num: int) -> None:
+        """Apply initial AddRoundKey using key shares (all shares get key part)."""
+        self.randomness_counter.snapshot()
         self.cycle_counter.increment(ADD_ROUND_KEY_CYCLES)
 
-        round_key = self._round_keys[round_num]
-        self._state_shares = apply_add_round_key_to_shares(self._state_shares, round_key)
+        for i in range(self.num_shares):
+            self._state_shares[i] = add_round_key(self._state_shares[i], key_shares[i])
+
+        recombined = self._recombine_state(self._state_shares)
+
+        if self._vt:
+            self._vt.cycle_line(self.cycle_counter.count, round_num,
+                                f"AddRoundKey(k{round_num})", recombined)
+            self._vt.share_dump(self._state_shares, recombined, "shares")
 
         if self.tracer:
             self.tracer.record(
                 cycle=self.cycle_counter.count,
                 round=round_num,
                 operation="AddRoundKey",
-                shares=[copy_state(s) for s in self._state_shares],
-                recombined=self._recombine_state(self._state_shares),
-                round_key=copy_state(round_key),
-                cycles_so_far=self.cycle_counter.count,
-                random_bits_so_far=self.randomness_counter.total_bits,
+                recombined=recombined,
+            )
+
+    def _add_round_key(self, round_num: int) -> None:
+        """Apply AddRoundKey with unmasked round key to share 0 only."""
+        self.randomness_counter.snapshot()
+        self.cycle_counter.increment(ADD_ROUND_KEY_CYCLES)
+
+        round_key = self._round_keys[round_num]
+        self._state_shares = apply_add_round_key_to_shares(self._state_shares, round_key)
+
+        recombined = self._recombine_state(self._state_shares)
+
+        if self._vt:
+            self._vt.cycle_line(self.cycle_counter.count, round_num,
+                                f"AddRoundKey(k{round_num})", recombined)
+
+        if self.tracer:
+            self.tracer.record(
+                cycle=self.cycle_counter.count,
+                round=round_num,
+                operation="AddRoundKey",
+                recombined=recombined,
             )
 
     def _sub_bytes(self, round_num: int) -> None:
-        """
-        Apply SubBytes to state shares using pipelined S-box.
-
-        Processes 16 bytes serially through the pipeline.
-        Total cycles = 16 + (pipeline_depth - 1)
-        """
+        """Apply SubBytes to state shares using pipelined S-box."""
         sbox = self._create_sbox()
+        vt = self._vt
+
+        # Recombined state before SubBytes (for boundary display)
+        recombined_before = self._recombine_state(self._state_shares)
+        if vt:
+            vt.op_boundary(round_num, "SubBytes", "begin", recombined_before)
 
         # Collect input bytes (column-major order)
         input_shares_list = []
@@ -240,29 +275,50 @@ class DomModel:
                 input_shares_list.append((row, col, byte_shares))
 
         # Output storage
-        output_shares_list = []
+        output_shares_list: list[list[int]] = []
+        # Map from output index to byte index (for pop tracking)
+        output_byte_indices: list[int] = []
 
-        # Feed bytes into pipeline and collect outputs
         input_idx = 0
-        byte_idx = 0
 
-        # Feed all 16 bytes and process
         while input_idx < 16 or not sbox.is_empty():
-            # Push new input if available and pipeline can accept
+            self.randomness_counter.snapshot()
+
+            # Push new input if available
             if input_idx < 16 and sbox.can_accept():
                 row, col, byte_shares = input_shares_list[input_idx]
                 sbox.push(byte_shares, byte_index=input_idx)
                 input_idx += 1
 
-            # Step pipeline (this increments cycle counter)
+            # Step pipeline
             sbox.step()
 
             # Pop output if ready
+            pop_info: list[dict] = []
             if sbox.is_ready():
+                entry = sbox.peek()
+                bi = entry["byte_index"] if entry else -1
                 out_shares = sbox.pop()
-                output_shares_list.append(out_shares)
+                if out_shares is not None:
+                    output_shares_list.append(out_shares)
+                    output_byte_indices.append(bi)
+                    pop_info.append({
+                        "byte_index": bi,
+                        "recombined": recombine_shares(out_shares),
+                    })
 
-        # Flush any remaining items
+            if vt:
+                vt.cycle_line(
+                    self.cycle_counter.count,
+                    round_num,
+                    "SubBytes(pipe)",
+                    recombined=None,
+                    pipe_occ=sbox.get_occupancy(),
+                    num_stages=sbox.num_stages,
+                    pop_info=pop_info if pop_info else None,
+                )
+
+        # Flush safety net (should be empty)
         remaining = sbox.flush()
         output_shares_list.extend(remaining)
 
@@ -277,49 +333,60 @@ class DomModel:
             for s in range(self.num_shares):
                 self._state_shares[s][row][col] = out_shares[s]
 
+        # Op boundary end
+        recombined_after = self._recombine_state(self._state_shares)
+        if vt:
+            vt.op_boundary(round_num, "SubBytes", "end", recombined_after)
+
+        # JSON record
         if self.tracer:
             self.tracer.record(
                 cycle=self.cycle_counter.count,
                 round=round_num,
                 operation="SubBytes",
-                shares=[copy_state(s) for s in self._state_shares],
-                recombined=self._recombine_state(self._state_shares),
-                cycles_so_far=self.cycle_counter.count,
-                random_bits_so_far=self.randomness_counter.total_bits,
+                recombined=recombined_after,
             )
 
     def _shift_rows(self, round_num: int) -> None:
         """Apply ShiftRows to each share independently."""
+        self.randomness_counter.snapshot()
         self.cycle_counter.increment(SHIFT_ROWS_CYCLES)
 
         self._state_shares = apply_shift_rows_to_shares(self._state_shares)
+
+        recombined = self._recombine_state(self._state_shares)
+
+        if self._vt:
+            self._vt.cycle_line(self.cycle_counter.count, round_num,
+                                "ShiftRows", recombined)
 
         if self.tracer:
             self.tracer.record(
                 cycle=self.cycle_counter.count,
                 round=round_num,
                 operation="ShiftRows",
-                shares=[copy_state(s) for s in self._state_shares],
-                recombined=self._recombine_state(self._state_shares),
-                cycles_so_far=self.cycle_counter.count,
-                random_bits_so_far=self.randomness_counter.total_bits,
+                recombined=recombined,
             )
 
     def _mix_columns(self, round_num: int) -> None:
         """Apply MixColumns to each share independently."""
+        self.randomness_counter.snapshot()
         self.cycle_counter.increment(MIX_COLUMNS_CYCLES)
 
         self._state_shares = apply_mix_columns_to_shares(self._state_shares)
+
+        recombined = self._recombine_state(self._state_shares)
+
+        if self._vt:
+            self._vt.cycle_line(self.cycle_counter.count, round_num,
+                                "MixColumns", recombined)
 
         if self.tracer:
             self.tracer.record(
                 cycle=self.cycle_counter.count,
                 round=round_num,
                 operation="MixColumns",
-                shares=[copy_state(s) for s in self._state_shares],
-                recombined=self._recombine_state(self._state_shares),
-                cycles_so_far=self.cycle_counter.count,
-                random_bits_so_far=self.randomness_counter.total_bits,
+                recombined=recombined,
             )
 
     def _full_round(self, round_num: int) -> None:
