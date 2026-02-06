@@ -1,1 +1,3 @@
-"""Tests for AES evaluation framework."""
+"""
+Tests for AES Architecture Exploration.
+"""
