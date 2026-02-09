@@ -332,9 +332,17 @@ def run_unprotected_round(
     out_hex = state_to_hex(state_out)
     out.p(f"State entering Round 1: {in_hex}")
     out.p(f"State after   Round 1: {out_hex}")
-    out.p(f"Cycles: {cycles}")
+    out.p("")
+    out.p("Cycle breakdown:")
+    out.p("  AddRoundKey (Round 0):                  1 cycle")
+    out.p("  Round 1 (SubBytes+ShiftRows+MixColumns+AddRoundKey): 1 cycle")
+    out.p(f"  Total:                                  {cycles} cycles")
+    out.p("")
+    out.p("Randomness: 0 bits (unprotected model)")
 
-    jl.emit(stage="summary", state_in=in_hex, state_out=out_hex, cycles=cycles)
+    jl.emit(stage="summary", state_in=in_hex, state_out=out_hex, cycles=cycles,
+            cycle_breakdown={"add_round_key_0": 1, "round_1": 1},
+            random_bits=0)
 
     return {
         "state_in_round1": state_in,
@@ -460,11 +468,18 @@ def run_dom_round(
     # ── 4. Round 1 walkthrough ──────────────────────────────────
     out.section("4. Round 1 Walkthrough (DOM)")
 
+    # Track per-step costs
+    cycles_before_r1 = cycle_counter.count
+    rng_before_r1 = rng_counter.total_bits
+
     # 4.1 SubBytes
     out.subsection("4.1  SubBytes (DOM S-box Pipeline)")
     out.p(f"  Byte-serial through {sbox_variant}-stage Canright pipeline")
     out.p(f"  Processing 16 bytes in column-major order (b0..b15)")
     out.p("")
+
+    cycles_before_sb = cycle_counter.count
+    rng_before_sb = rng_counter.total_bits
 
     sbox = DomCanrightSBoxPipeline(
         d=d, variant=sbox_variant, rng=rng,
@@ -482,7 +497,6 @@ def run_dom_round(
 
     output_map: dict[int, list[int]] = {}
     input_ptr = 0
-    rng_before_sb = rng_counter.total_bits
 
     # Run pipeline
     while input_ptr < 16 or not sbox.is_empty():
@@ -501,6 +515,7 @@ def run_dom_round(
 
     remaining = sbox.flush()
     rng_sb = rng_counter.total_bits - rng_before_sb
+    cycles_sb = cycle_counter.count - cycles_before_sb
 
     # Write outputs back
     for idx, row, col, in_shares in input_list:
@@ -545,12 +560,15 @@ def run_dom_round(
     jl.emit(stage="subbytes_done",
             shares=[_state_hex(s) for s in state_shares],
             recombined=_state_hex(after_sb_recomb),
-            rnd_bits_subbytes=rng_sb)
+            cycles=cycles_sb, random_bits=rng_sb)
 
     # 4.2 ShiftRows
     out.subsection("4.2  ShiftRows (linear, per-share)")
     out.p("ShiftRows is linear => applied independently to each share.")
     out.p("Row i is shifted LEFT by i positions.")
+
+    cycles_before_sr = cycle_counter.count
+    rng_before_sr = rng_counter.total_bits
 
     state_shares = apply_shift_rows_to_shares(state_shares)
     after_sr_recomb = _recombine(state_shares)
@@ -561,22 +579,30 @@ def run_dom_round(
         out.p(f"  Row {r} (shift {r}): [{' '.join(before_vals)}] -> [{' '.join(after_vals)}]")
 
     cycle_counter.increment(1)
+    cycles_sr = cycle_counter.count - cycles_before_sr
+    rng_sr = rng_counter.total_bits - rng_before_sr
     out.p("")
     _print_shares_and_recomb(out, "After ShiftRows", state_shares, after_sr_recomb)
 
     jl.emit(stage="shiftrows",
             shares=[_state_hex(s) for s in state_shares],
-            recombined=_state_hex(after_sr_recomb))
+            recombined=_state_hex(after_sr_recomb),
+            cycles=cycles_sr, random_bits=rng_sr)
 
     # 4.3 MixColumns
     out.subsection("4.3  MixColumns (linear, per-share)")
     out.p("MixColumns is linear => applied independently to each share.")
     out.p("The recombined result matches unmasked MixColumns on recombined input.")
 
+    cycles_before_mc = cycle_counter.count
+    rng_before_mc = rng_counter.total_bits
+
     state_shares = apply_mix_columns_to_shares(state_shares)
     after_mc_recomb = _recombine(state_shares)
 
     cycle_counter.increment(1)
+    cycles_mc = cycle_counter.count - cycles_before_mc
+    rng_mc = rng_counter.total_bits - rng_before_mc
 
     # Show column details on recombined values
     for col in range(4):
@@ -600,10 +626,15 @@ def run_dom_round(
     out.subsection("4.4  AddRoundKey (Round 1)")
     out.p("Round key XOR applied ONLY to Share 0 (masking semantics).")
 
+    cycles_before_ark = cycle_counter.count
+    rng_before_ark = rng_counter.total_bits
+
     state_shares = apply_add_round_key_to_shares(state_shares, round_keys[1])
     state_out = _recombine(state_shares)
 
     cycle_counter.increment(1)
+    cycles_ark = cycle_counter.count - cycles_before_ark
+    rng_ark = rng_counter.total_bits - rng_before_ark
 
     out.p("")
     out.p("RoundKey[1]:")
@@ -637,18 +668,60 @@ def run_dom_round(
     out_hex = _state_hex(state_out)
     out.p(f"State entering Round 1 (recombined): {in_hex}")
     out.p(f"State after   Round 1 (recombined): {out_hex}")
-    out.p(f"Cycles: {cycle_counter.count}")
-    out.p(f"Random bits consumed: {rng_counter.total_bits}")
+
+    # Pre-round costs
+    cycles_r0 = cycles_before_r1  # cycles consumed before Round 1 started
+    rng_masking = rng_before_r1   # randomness consumed for key+state masking + ARK(R0)
+
+    total_cycles = cycle_counter.count
+    total_rng = rng_counter.total_bits
+
+    out.p("")
+    out.p("Cycle breakdown:")
+    out.p(f"  Pre-round (masking + AddRoundKey R0):  {cycles_r0:>4} cycles")
+    out.p(f"  SubBytes  (DOM S-box pipeline):        {cycles_sb:>4} cycles")
+    out.p(f"  ShiftRows:                             {cycles_sr:>4} cycle{'s' if cycles_sr != 1 else ''}")
+    out.p(f"  MixColumns:                            {cycles_mc:>4} cycle{'s' if cycles_mc != 1 else ''}")
+    out.p(f"  AddRoundKey (Round 1):                 {cycles_ark:>4} cycle{'s' if cycles_ark != 1 else ''}")
+    out.p(f"  Total:                                 {total_cycles:>4} cycles")
+
+    out.p("")
+    out.p("Randomness breakdown:")
+    out.p(f"  Key masking + State masking:           {rng_masking:>5} bits")
+    out.p(f"  SubBytes (DOM S-box pipeline):         {rng_sb:>5} bits")
+    out.p(f"  ShiftRows:                             {rng_sr:>5} bits")
+    out.p(f"  MixColumns:                            {rng_mc:>5} bits")
+    out.p(f"  AddRoundKey (Round 1):                 {rng_ark:>5} bits")
+    out.p(f"  Total:                                 {total_rng:>5} bits")
+
+    cycle_breakdown = {
+        "pre_round": cycles_r0,
+        "subbytes": cycles_sb,
+        "shiftrows": cycles_sr,
+        "mixcolumns": cycles_mc,
+        "add_round_key_1": cycles_ark,
+    }
+    rng_breakdown = {
+        "masking": rng_masking,
+        "subbytes": rng_sb,
+        "shiftrows": rng_sr,
+        "mixcolumns": rng_mc,
+        "add_round_key_1": rng_ark,
+    }
 
     jl.emit(stage="summary", state_in=in_hex, state_out=out_hex,
-            cycles=cycle_counter.count, random_bits=rng_counter.total_bits)
+            cycles=total_cycles, random_bits=total_rng,
+            cycle_breakdown=cycle_breakdown,
+            random_bits_breakdown=rng_breakdown)
 
     return {
         "state_in_round1": state_in,
         "state_out_round1": state_out,
         "shares_out": [copy_state(s) for s in state_shares],
-        "cycles": cycle_counter.count,
-        "random_bits": rng_counter.total_bits,
+        "cycles": total_cycles,
+        "random_bits": total_rng,
+        "cycle_breakdown": cycle_breakdown,
+        "random_bits_breakdown": rng_breakdown,
     }
 
 

@@ -178,9 +178,10 @@ def round_command(args: argparse.Namespace) -> int:
                 verbose=args.verbose,
                 trace_file=trace_file,
             )
-            print(f"\nState entering Round 1: {_state_to_hex(result['state_in_round1'])}")
-            print(f"State after   Round 1: {_state_to_hex(result['state_out_round1'])}")
-            print(f"Cycles: {result['cycles']}")
+            if not args.verbose:
+                print(f"State entering Round 1: {_state_to_hex(result['state_in_round1'])}")
+                print(f"State after   Round 1: {_state_to_hex(result['state_out_round1'])}")
+                print(f"Cycles: {result['cycles']}")
 
         elif args.model == "dom":
             d = args.d if args.d else 1
@@ -195,10 +196,11 @@ def round_command(args: argparse.Namespace) -> int:
                 verbose=args.verbose,
                 trace_file=trace_file,
             )
-            print(f"\nState entering Round 1 (recombined): {_state_to_hex(result['state_in_round1'])}")
-            print(f"State after   Round 1 (recombined): {_state_to_hex(result['state_out_round1'])}")
-            print(f"Cycles: {result['cycles']}")
-            print(f"Random bits consumed: {result['random_bits']}")
+            if not args.verbose:
+                print(f"State entering Round 1 (recombined): {_state_to_hex(result['state_in_round1'])}")
+                print(f"State after   Round 1 (recombined): {_state_to_hex(result['state_out_round1'])}")
+                print(f"Cycles: {result['cycles']}")
+                print(f"Random bits consumed: {result['random_bits']}")
 
         else:
             print(f"Error: Unknown model '{args.model}'")
