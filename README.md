@@ -74,6 +74,30 @@ python -m aes_explore.cli run --model unprotected_ht --verbose
 python -m aes_explore.cli run --model dom --d 1 --sbox-variant 5 --verbose --seed 123
 ```
 
+### Round Mode (Didactic Walkthrough)
+
+The `round` subcommand performs **only** Round 0 (initial AddRoundKey) + Round 1 and explains every transformation step in detail. It accepts the same flags as `run`:
+
+```bash
+# Unprotected walkthrough (verbose)
+python -m aes_explore.cli round --model unprotected_ht --verbose
+
+# DOM walkthrough (d=1, 5-stage S-box)
+python -m aes_explore.cli round --model dom --d 1 --sbox-variant 5 --seed 42 --verbose
+
+# DOM with d=2 and JSONL trace
+python -m aes_explore.cli round --model dom --d 2 --seed 99 --trace round_trace.jsonl --verbose
+```
+
+Output sections (when `--verbose` is active):
+1. **State layout primer** — column-major indexing overview
+2. **Inputs** — key, plaintext, round keys 0 and 1
+3. **Pre-round (Round 0 AddRoundKey)** — per-byte XOR table
+4. **Round 1 walkthrough** — SubBytes, ShiftRows, MixColumns, AddRoundKey with per-byte details
+5. **Summary** — hex states entering/leaving Round 1
+
+For DOM mode, each stage also shows per-share matrices and recombined values.
+
 ### JSON Trace Output
 
 Add `--trace <filename>` to output machine-readable JSON Lines:
@@ -93,9 +117,10 @@ If `--key` and/or `--pt` are not provided, the following defaults are used:
 ## CLI Options
 
 ```
-python -m aes_explore.cli run [OPTIONS]
+python -m aes_explore.cli run   [OPTIONS]   # Full 10-round encryption
+python -m aes_explore.cli round [OPTIONS]   # Didactic Round 0+1 walkthrough
 
-Options:
+Options (shared by both commands):
   --model TEXT        Model name: unprotected_ht or dom (required)
   --key TEXT          AES-128 key as 32 hex chars (optional, uses default)
   --pt TEXT           Plaintext as 32 hex chars (optional, uses default)
@@ -145,6 +170,7 @@ aes_exploration/
 │       ├── trace.py                       # TraceRecorder + pretty printers
 │       ├── counters.py                    # CycleCounter, RandomnessCounter
 │       ├── aes_core.py                    # Shared AES primitives
+│       ├── round_didactic.py              # Didactic Round 0+1 walkthrough
 │       ├── dom/
 │       │   ├── __init__.py
 │       │   ├── gf_canright.py             # GF(2^n) arithmetic helpers
@@ -157,7 +183,8 @@ aes_exploration/
 └── tests/
     ├── __init__.py
     ├── test_vectors.py                    # Known AES-128 test vectors
-    └── test_randomized_vs_library.py      # Randomized verification tests
+    ├── test_randomized_vs_library.py      # Randomized verification tests
+    └── test_round_mode.py                 # Round mode correctness tests
 ```
 
 ## Models Overview
